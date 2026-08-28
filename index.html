@@ -79,7 +79,10 @@
   .banner{
     background:#FBE9E4;border:1px solid var(--brick);color:var(--brick);
     padding:12px 16px;border-radius:6px;font-size:13.5px;margin-bottom:24px;display:none;
+    white-space:pre-wrap;
   }
+  .banner code{background:rgba(0,0,0,.06);padding:1px 5px;border-radius:3px;}
+  .banner.warn{background:#FBF3D9;border-color:var(--saffron);color:#7a5c0a;}
 
   .kpi-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:36px;}
   .kpi{
@@ -234,6 +237,19 @@
 <script>
 const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS3ifwQVvs7z6BXQlFBLf6gLyo53VJ0G2WcUcIwHp8-cFJcnsQuEISl-ipQVf4uvRzdTI5VhWlZfEbH/pub?output=csv";
 
+// Accepted variants for each field, so small header differences (spacing, apostrophes,
+// case) don't silently produce blank columns.
+const FIELD_ALIASES = {
+  name: ["Applicant Name", "Applicant name", "Name", "Student Name"],
+  roll: ["NMMS Roll No", "NMMS Roll Number", "Roll No", "Roll Number"],
+  dob: ["DOB", "Date of Birth"],
+  father: ["Fathers Name", "Father's Name", "Father Name", "Father'S Name"],
+  category: ["Category"],
+  gender: ["Gender", "Sex"],
+  institution: ["Institution Name", "Institution", "School Name", "School"],
+  zone: ["Zone", "Zone Name"]
+};
+
 let rows = [];
 let filtered = [];
 let page = 0;
@@ -248,34 +264,127 @@ function setSync(ok, msg){
   document.getElementById('footTime').textContent = new Date().toLocaleString();
 }
 
+function showBanner(html, isWarning){
+  const banner = document.getElementById('errBanner');
+  banner.className = 'banner' + (isWarning ? ' warn' : '');
+  banner.style.display = 'block';
+  banner.innerHTML = html;
+}
+
+function hideBanner(){
+  document.getElementById('errBanner').style.display = 'none';
+}
+
+function pickField(rowObj, aliases){
+  for(const key of Object.keys(rowObj)){
+    const trimmedKey = key.trim();
+    if(aliases.some(a => a.toLowerCase() === trimmedKey.toLowerCase())){
+      return (rowObj[key] || '').toString().trim();
+    }
+  }
+  return '';
+}
+
 async function loadData(){
   setSync(true, 'syncing…');
-  document.getElementById('errBanner').style.display = 'none';
+  hideBanner();
   try{
     const bustUrl = CSV_URL + (CSV_URL.includes('?') ? '&' : '?') + '_ts=' + Date.now();
-    const res = await fetch(bustUrl, {cache:'no-store'});
-    if(!res.ok) throw new Error('HTTP ' + res.status);
+
+    // Google's pub?output=csv redirects to a googleusercontent.com host that doesn't
+    // reliably send Access-Control-Allow-Origin for fetches from arbitrary domains.
+    // Try the direct request first; if the browser blocks it as a CORS/network error,
+    // fall back to a public CORS proxy that fetches it server-side and re-serves it
+    // with permissive CORS headers.
+    const PROXY_FALLBACKS = [
+      url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+      url => 'https://corsproxy.io/?url=' + encodeURIComponent(url)
+    ];
+
+    let res = null;
+    let lastErr = null;
+    try{
+      res = await fetch(bustUrl, {cache:'no-store'});
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+    }catch(directErr){
+      lastErr = directErr;
+      res = null;
+      for(const buildProxyUrl of PROXY_FALLBACKS){
+        try{
+          const proxied = await fetch(buildProxyUrl(bustUrl), {cache:'no-store'});
+          if(!proxied.ok) throw new Error('HTTP ' + proxied.status);
+          res = proxied;
+          break;
+        }catch(proxyErr){
+          lastErr = proxyErr;
+        }
+      }
+    }
+
+    if(!res){
+      // All direct + proxy attempts failed. A raw "Failed to fetch" most commonly means
+      // either the sheet isn't actually published (only "Shared"), or every CORS proxy
+      // fallback is also currently unreachable/rate-limited.
+      throw new Error(
+        'Could not reach Google Sheets directly or through a CORS proxy (last error: ' +
+        (lastErr ? lastErr.message : 'unknown') + '). Confirm the sheet was published via ' +
+        '<b>File → Share → Publish to web → select the sheet → CSV</b> (not just "Share" with ' +
+        'viewer access). If it is published, this may just be a temporarily unreachable proxy — hit Refresh.'
+      );
+    }
+
     const text = await res.text();
-    const parsed = Papa.parse(text.trim(), {header:true, skipEmptyLines:true});
-    if(!parsed.data.length) throw new Error('No rows returned');
+    const trimmedText = text.trim();
+
+    if(trimmedText.startsWith('<') || /accounts\.google\.com/i.test(trimmedText.slice(0,500))){
+      throw new Error(
+        'Received an HTML page instead of CSV data. This means the sheet is not published ' +
+        'to the web (or the publish was revoked). Go to <b>File → Share → Publish to web</b> ' +
+        'in the sheet, publish the correct tab as CSV, and copy the fresh link into CSV_URL.'
+      );
+    }
+
+    const parsed = Papa.parse(trimmedText, {header:true, skipEmptyLines:true});
+    if(parsed.errors && parsed.errors.length){
+      console.warn('CSV parse warnings:', parsed.errors);
+    }
+    if(!parsed.data.length) throw new Error('The sheet returned no rows. Confirm Sheet1 actually has data below the header row.');
+
+    const detectedHeaders = parsed.meta && parsed.meta.fields ? parsed.meta.fields : Object.keys(parsed.data[0] || {});
+
     rows = parsed.data.map(r => ({
-      name: (r['Applicant Name']||'').trim(),
-      roll: (r['NMMS Roll No']||'').trim(),
-      dob: (r['DOB']||'').trim(),
-      father: (r['Fathers Name']||'').trim(),
-      category: (r['Category']||'').trim().toUpperCase() || 'UNSPECIFIED',
-      gender: (r['Gender']||'').trim().toUpperCase() || 'UNSPECIFIED',
-      institution: (r['Institution Name']||'').trim(),
-      zone: (r['Zone']||'').trim().toUpperCase() || 'UNSPECIFIED'
+      name: pickField(r, FIELD_ALIASES.name),
+      roll: pickField(r, FIELD_ALIASES.roll),
+      dob: pickField(r, FIELD_ALIASES.dob),
+      father: pickField(r, FIELD_ALIASES.father),
+      category: (pickField(r, FIELD_ALIASES.category) || 'UNSPECIFIED').toUpperCase(),
+      gender: (pickField(r, FIELD_ALIASES.gender) || 'UNSPECIFIED').toUpperCase(),
+      institution: pickField(r, FIELD_ALIASES.institution),
+      zone: (pickField(r, FIELD_ALIASES.zone) || 'UNSPECIFIED').toUpperCase()
     })).filter(r => r.name);
+
+    if(!rows.length){
+      // Data came back and parsed, but none of the expected columns matched —
+      // surface the actual headers so the mismatch is obvious instead of a blank dashboard.
+      showBanner(
+        'The sheet loaded (' + parsed.data.length + ' data row(s)) but none of the expected ' +
+        'columns were found, so 0 applicants were mapped.<br>Columns detected in the sheet: ' +
+        '<code>' + detectedHeaders.join('</code>, <code>') + '</code><br>' +
+        'Update the FIELD_ALIASES list near the top of the script to match these exact header names.',
+        true
+      );
+      setSync(false, 'column mismatch');
+      document.getElementById('subhead').textContent = 'Loaded but could not map columns — see notice above.';
+      render();
+      return;
+    }
+
     setSync(true, `live · ${rows.length} rows`);
     document.getElementById('subhead').textContent = `Live register — ${rows.length} applicants across ${new Set(rows.map(r=>r.zone)).size} zones`;
     render();
   }catch(err){
     setSync(false, 'fetch failed');
-    const banner = document.getElementById('errBanner');
-    banner.style.display = 'block';
-    banner.textContent = `Couldn't fetch live data (${err.message}). Make sure the sheet's sharing is set to "Anyone with the link – Viewer", then hit Refresh.`;
+    showBanner('<b>Couldn\'t load live data:</b><br>' + err.message, false);
     document.getElementById('subhead').textContent = 'Waiting for a readable connection to the sheet…';
   }
 }
@@ -346,6 +455,11 @@ function render(){
   applyFilters();
 }
 
+function escapeHtml(str){
+  return (str || '').toString()
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function applyFilters(){
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
   const z = document.getElementById('zoneFilter').value;
@@ -367,14 +481,14 @@ function renderTable(){
   const pageRows = filtered.slice(start, start + PAGE_SIZE);
   document.getElementById('tableBody').innerHTML = pageRows.map(r => `
     <tr>
-      <td>${r.name}</td>
-      <td class="roll">${r.roll}</td>
-      <td>${r.dob}</td>
-      <td>${r.father}</td>
-      <td><span class="tag ${r.category}">${r.category}</span></td>
-      <td>${r.gender}</td>
-      <td>${r.institution}</td>
-      <td>${r.zone}</td>
+      <td>${escapeHtml(r.name)}</td>
+      <td class="roll">${escapeHtml(r.roll)}</td>
+      <td>${escapeHtml(r.dob)}</td>
+      <td>${escapeHtml(r.father)}</td>
+      <td><span class="tag ${escapeHtml(r.category)}">${escapeHtml(r.category)}</span></td>
+      <td>${escapeHtml(r.gender)}</td>
+      <td>${escapeHtml(r.institution)}</td>
+      <td>${escapeHtml(r.zone)}</td>
     </tr>`).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--ink-soft);padding:20px;">No matching applicants</td></tr>';
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   document.getElementById('pagerInfo').textContent = `${filtered.length} matches · page ${page+1} of ${totalPages}`;
